@@ -15,6 +15,34 @@ admin.initializeApp({
 });
 
 const db = admin.firestore();
+//GPS 
+
+
+/**
+ * Reverse geocode using OpenStreetMap (Nominatim)
+ * Converts lat/lng → human-readable address
+ */
+async function reverseGeocode(lat, lng) {
+  const url =
+    `https://nominatim.openstreetmap.org/reverse` +
+    `?format=jsonv2&lat=${lat}&lon=${lng}`;
+
+  const res = await fetch(url, {
+    headers: {
+      // REQUIRED by OpenStreetMap usage policy
+      "User-Agent": "CleanCityApp/1.0 (educational project)",
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error("Reverse geocoding request failed");
+  }
+
+  const data = await res.json();
+
+  // display_name is the most readable address
+  return data.display_name || null;
+}
 
 /*************************************************
  * EXPRESS APP
@@ -86,10 +114,14 @@ async function calculateAdvancedPriority({
 }) {
   let score = 0;
 
+  // 🔹 Object detection contribution
   score += Math.min(garbageObjectCount * 15, 45);
   if (garbageObjectCount >= 3) score += 15;
-  score += garbageConfidence * 50;
 
+  // 🔥 AI confidence weight
+  score += garbageConfidence * 80;
+
+  // 🔹 Nearby repeat complaints
   const oneWeekAgo = admin.firestore.Timestamp.fromMillis(
     Date.now() - 7 * 24 * 60 * 60 * 1000
   );
@@ -113,17 +145,39 @@ async function calculateAdvancedPriority({
   });
 
   score += Math.min(repeatComplaintsNearby * 5, 20);
-  if (score < 40) score = 40;
 
+  // 🔹 Conditional severity floor
+  if (garbageConfidence < 0.25 && score < 20) {
+    score = 20;
+  } else if (score < 40) {
+    score = 40;
+  }
+
+  // 🔹 Clamp to 0–100
   score = Math.min(Math.round(score), 100);
 
+  // ============================
+  // 🔒 ADD THIS BLOCK RIGHT HERE
+  // ============================
+  // Prevent false HIGH / CRITICAL
+  if (score >= 60) {
+    // Require strong evidence for HIGH
+    if (garbageObjectCount < 2 && garbageConfidence < 0.6) {
+      score = Math.min(score, 55); // force MEDIUM
+    }
+  }
+  // ============================
+
+  // 🔹 Priority mapping
   let priority = "LOW";
   if (score >= 80) priority = "CRITICAL";
   else if (score >= 60) priority = "HIGH";
-  else priority = "MEDIUM";
+  else if (score >= 40) priority = "MEDIUM";
+  else priority = "LOW";
 
   return { priority, severityScore: score };
 }
+
 
 /*************************************************
  * EXISTING CLOUD FUNCTIONS (UNCHANGED)
@@ -135,6 +189,14 @@ async function calculateAdvancedPriority({
 app.post("/registerComplaint", authenticate, async (req, res) => {
   try {
     const { description, location, imagePath } = req.body;
+    let address = null;
+
+try {
+  address = await reverseGeocode(location.lat, location.lng);
+} catch (err) {
+  console.error("⚠️ Reverse geocode failed:", err.message);
+  // We DO NOT fail the complaint if address lookup fails
+}
 
     if (!description || !location || !imagePath) {
       return res.status(400).json({ message: "Missing required fields" });
@@ -148,39 +210,77 @@ app.post("/registerComplaint", authenticate, async (req, res) => {
     const [labelResult] = await visionClient.labelDetection(gcsUri);
     const [objectResult] = await visionClient.objectLocalization(gcsUri);
 
-    let garbageConfidence = 0;
-    let garbageObjectCount = 0;
+ let garbageConfidence = 0;
+let garbageObjectCount = 0;
+let personDetected = false;
 
-    // ✅ ORIGINAL KEYWORDS — UNCHANGED
-    const garbageKeywords = [
-      "garbage",
-      "trash",
-      "waste",
-      "dump",
-      "litter",
-      "plastic",
-      "pollution"
-    ];
+// 🔹 Garbage-related keywords
+const garbageKeywords = [
+  "garbage",
+  "trash",
+  "waste",
+  "dump",
+  "dumping",
+  "litter",
+  "plastic",
+  "pollution",
+  "rubbish",
+  "refuse",
+  "landfill",
+  "junk",
+  "scrap",
+  "debris"
+];
 
-    (labelResult.labelAnnotations || []).forEach(label => {
-      if (
-        garbageKeywords.some(keyword =>
-          label.description.toLowerCase().includes(keyword)
-        )
-      ) {
-        garbageConfidence = Math.max(garbageConfidence, label.score);
-      }
-    });
+// 1️⃣ Label-based signals
+(labelResult.labelAnnotations || []).forEach(label => {
+  const desc = label.description.toLowerCase();
 
-    (objectResult.localizedObjectAnnotations || []).forEach(object => {
-      if (
-        garbageKeywords.some(keyword =>
-          object.name.toLowerCase().includes(keyword)
-        )
-      ) {
-        garbageObjectCount++;
-      }
-    });
+  if (garbageKeywords.some(k => desc.includes(k))) {
+    garbageConfidence = Math.max(garbageConfidence, label.score);
+  }
+
+  if (desc.includes("person") || desc.includes("face")) {
+    personDetected = true;
+  }
+});
+
+// 2️⃣ Object-based signals
+(objectResult.localizedObjectAnnotations || []).forEach(object => {
+  const name = object.name.toLowerCase();
+
+  if (
+    name.includes("plastic") ||
+    name.includes("bag") ||
+    name.includes("bottle") ||
+    name.includes("waste") ||
+    name.includes("container")
+  ) {
+    garbageObjectCount++;
+  }
+
+  if (name.includes("person")) {
+    personDetected = true;
+  }
+});
+
+// 3️⃣ 🔥 SMART FALLBACK (KEY FIX)
+// Apply baseline ONLY if:
+// - no person detected
+// - AND scene is likely outdoor garbage context
+if (
+  garbageConfidence === 0 &&
+  garbageObjectCount === 0 &&
+  !personDetected
+) {
+  garbageConfidence = 0.3; // LOW baseline, not 0.5
+}
+
+// 4️⃣ Strong garbage signal
+if (garbageObjectCount >= 3) {
+  garbageConfidence = Math.max(garbageConfidence, 0.8);
+}
+
 
     const { priority, severityScore } =
       await calculateAdvancedPriority({
@@ -190,23 +290,22 @@ app.post("/registerComplaint", authenticate, async (req, res) => {
       });
 
     // ✅ Generate public image URL
-    const file = admin.storage().bucket().file(imagePath);
-    const [imageUrl] = await file.getSignedUrl({
-      action: "read",
-      expires: "03-01-2030",
-    });
+   
 
     const docRef = await db.collection("complaints").add({
-      description,
-      location,
-      imagePath,
-      imageUrl,
-      createdBy: userId,
-      status: "OPEN",
-      priority,
-      severityScore,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
+  description,
+  location: {
+    ...location,
+    address,
+  },
+  imagePath, // ✅ ONLY store path
+  createdBy: userId,
+  status: "OPEN",
+  priority,
+  severityScore,
+  createdAt: admin.firestore.FieldValue.serverTimestamp(),
+});
+
 
     return res.json({
       success: true,
@@ -449,7 +548,7 @@ app.get("/getAdminComplaints", authenticate, async (req, res) => {
 
     const snap = await db
       .collection("complaints")
-      .orderBy("createdAt", "desc")
+      
       .limit(50)
       .get();
 
