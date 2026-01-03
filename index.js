@@ -1,11 +1,104 @@
 /*************************************************
  * IMPORTS
  *************************************************/
+const { defineSecret } = require("firebase-functions/params");
+const OpenAI = require("openai");
+const OPENAI_API_KEY = defineSecret("OPENAI_API_KEY");
+
 const functions = require("firebase-functions");
 const admin = require("firebase-admin");
-const vision = require("@google-cloud/vision");
+
 const express = require("express");
 const cors = require("cors"); // ✅ ADDED
+const fetch = (...args) =>
+import("node-fetch").then(({ default: fetch }) => fetch(...args));
+
+
+async function downloadImageFromGCSAsBase64(imagePath) {
+  const bucket = admin
+    .storage()
+    .bucket("civicplatform-df911.firebasestorage.app");
+
+  console.log("🪣 USING BUCKET:", bucket.name);
+  console.log("📦 RAW IMAGE PATH:", imagePath);
+
+  const file = bucket.file(imagePath);
+  const [buffer] = await file.download();
+
+  return buffer.toString("base64");
+}
+
+function normalizeImagePath(imagePath) {
+  // gs://civicplatform-df911.firebasestorage.app/uploads/...
+  if (imagePath.startsWith("gs://")) {
+    return imagePath.replace(
+      "gs://civicplatform-df911.firebasestorage.app/",
+      ""
+    );
+  }
+
+  // https://firebasestorage.googleapis.com/v0/b/.../o/uploads%2F...
+  if (imagePath.startsWith("https://")) {
+    const decoded = decodeURIComponent(imagePath);
+    return decoded.split("/o/")[1].split("?")[0];
+  }
+
+  // uploads/...
+  return imagePath;
+}
+
+
+async function analyzeGarbageWithAI(imagePath) {
+  const openai = new OpenAI({
+    apiKey: OPENAI_API_KEY.value(),
+  });
+
+  const cleanPath = normalizeImagePath(imagePath);
+const base64Image = await downloadImageFromGCSAsBase64(cleanPath);
+
+
+  const response = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    temperature: 0,
+
+    messages: [
+      {
+        role: "system",
+        content: "You are a municipal sanitation inspector in India.",
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: `
+Respond ONLY in valid JSON.
+
+Schema:
+{
+  "isPublicGarbage": true | false,
+  "confidence": 0.0-1.0,
+  "severity": "LOW" | "MEDIUM" | "HIGH",
+  "reason": "short civic explanation"
+}
+Does this image show uncollected PUBLIC garbage?
+            `,
+          },
+          {
+            type: "image_url",
+            image_url: {
+              url: `data:image/jpeg;base64,${base64Image}`,
+            },
+          },
+        ],
+      },
+    ],
+    response_format: { type: "json_object" },
+  });
+
+  return JSON.parse(response.choices[0].message.content);
+}
+
 
 /*************************************************
  * FIREBASE INIT
@@ -104,80 +197,6 @@ function requireWorkerOrAdmin(req, res) {
   return true;
 }
 
-/*************************************************
- * ADVANCED PRIORITY SCORING (UNCHANGED)
- *************************************************/
-async function calculateAdvancedPriority({
-  garbageConfidence,
-  garbageObjectCount,
-  location,
-}) {
-  let score = 0;
-
-  // 🔹 Object detection contribution
-  score += Math.min(garbageObjectCount * 15, 45);
-  if (garbageObjectCount >= 3) score += 15;
-
-  // 🔥 AI confidence weight
-  score += garbageConfidence * 80;
-
-  // 🔹 Nearby repeat complaints
-  const oneWeekAgo = admin.firestore.Timestamp.fromMillis(
-    Date.now() - 7 * 24 * 60 * 60 * 1000
-  );
-
-  const nearbySnap = await db
-    .collection("complaints")
-    .where("createdAt", ">=", oneWeekAgo)
-    .get();
-
-  let repeatComplaintsNearby = 0;
-
-  nearbySnap.forEach((doc) => {
-    const d = doc.data();
-    if (
-      d.location &&
-      Math.abs(d.location.lat - location.lat) < 0.005 &&
-      Math.abs(d.location.lng - location.lng) < 0.005
-    ) {
-      repeatComplaintsNearby++;
-    }
-  });
-
-  score += Math.min(repeatComplaintsNearby * 5, 20);
-
-  // 🔹 Conditional severity floor
-  if (garbageConfidence < 0.25 && score < 20) {
-    score = 20;
-  } else if (score < 40) {
-    score = 40;
-  }
-
-  // 🔹 Clamp to 0–100
-  score = Math.min(Math.round(score), 100);
-
-  // ============================
-  // 🔒 ADD THIS BLOCK RIGHT HERE
-  // ============================
-  // Prevent false HIGH / CRITICAL
-  if (score >= 60) {
-    // Require strong evidence for HIGH
-    if (garbageObjectCount < 2 && garbageConfidence < 0.6) {
-      score = Math.min(score, 55); // force MEDIUM
-    }
-  }
-  // ============================
-
-  // 🔹 Priority mapping
-  let priority = "LOW";
-  if (score >= 80) priority = "CRITICAL";
-  else if (score >= 60) priority = "HIGH";
-  else if (score >= 40) priority = "MEDIUM";
-  else priority = "LOW";
-
-  return { priority, severityScore: score };
-}
-
 
 /*************************************************
  * EXISTING CLOUD FUNCTIONS (UNCHANGED)
@@ -204,105 +223,72 @@ try {
 
     const userId = req.user.uid;
 
-    const visionClient = new vision.ImageAnnotatorClient();
-    const gcsUri = `gs://civicplatform-df911.appspot.com/${imagePath}`;
 
-    const [labelResult] = await visionClient.labelDetection(gcsUri);
-    const [objectResult] = await visionClient.objectLocalization(gcsUri);
 
- let garbageConfidence = 0;
-let garbageObjectCount = 0;
-let personDetected = false;
+// 🔥 GEMINI ANALYSIS
+let ai;
+try {
+ai = await analyzeGarbageWithAI(imagePath);
 
-// 🔹 Garbage-related keywords
-const garbageKeywords = [
-  "garbage",
-  "trash",
-  "waste",
-  "dump",
-  "dumping",
-  "litter",
-  "plastic",
-  "pollution",
-  "rubbish",
-  "refuse",
-  "landfill",
-  "junk",
-  "scrap",
-  "debris"
-];
 
-// 1️⃣ Label-based signals
-(labelResult.labelAnnotations || []).forEach(label => {
-  const desc = label.description.toLowerCase();
 
-  if (garbageKeywords.some(k => desc.includes(k))) {
-    garbageConfidence = Math.max(garbageConfidence, label.score);
+  console.log("🧠 OPEN AI:", ai);
+} catch (err) {
+  console.error("❌ OPEN AI FAILED:", err.message);
+  ai = null;
+}
+/*************************************************
+ * 🧮 DETERMINISTIC SEVERITY (SOURCE OF TRUTH)
+ *************************************************/
+let severityScore = 40; // civic baseline
+let priority = "MEDIUM";
+
+if (ai) {
+  if (ai.isPublicGarbage && ai.confidence >= 0.75) {
+    severityScore += 20;
   }
 
-  if (desc.includes("person") || desc.includes("face")) {
-    personDetected = true;
-  }
-});
-
-// 2️⃣ Object-based signals
-(objectResult.localizedObjectAnnotations || []).forEach(object => {
-  const name = object.name.toLowerCase();
-
-  if (
-    name.includes("plastic") ||
-    name.includes("bag") ||
-    name.includes("bottle") ||
-    name.includes("waste") ||
-    name.includes("container")
-  ) {
-    garbageObjectCount++;
+  if (!ai.isPublicGarbage && ai.confidence >= 0.75) {
+    severityScore -= 15;
   }
 
-  if (name.includes("person")) {
-    personDetected = true;
-  }
-});
-
-// 3️⃣ 🔥 SMART FALLBACK (KEY FIX)
-// Apply baseline ONLY if:
-// - no person detected
-// - AND scene is likely outdoor garbage context
-if (
-  garbageConfidence === 0 &&
-  garbageObjectCount === 0 &&
-  !personDetected
-) {
-  garbageConfidence = 0.3; // LOW baseline, not 0.5
+  if (ai.severity === "HIGH") severityScore += 10;
+  if (ai.severity === "LOW") severityScore -= 10;
 }
 
-// 4️⃣ Strong garbage signal
-if (garbageObjectCount >= 3) {
-  garbageConfidence = Math.max(garbageConfidence, 0.8);
-}
+// Clamp score
+severityScore = Math.max(20, Math.min(100, severityScore));
+
+// Map to priority
+if (severityScore >= 80) priority = "CRITICAL";
+else if (severityScore >= 60) priority = "HIGH";
+else if (severityScore >= 40) priority = "MEDIUM";
+else priority = "LOW";
 
 
-    const { priority, severityScore } =
-      await calculateAdvancedPriority({
-        garbageConfidence,
-        garbageObjectCount,
-        location
-      });
-
-    // ✅ Generate public image URL
-   
-
-    const docRef = await db.collection("complaints").add({
+  const docRef = await db.collection("complaints").add({
   description,
   location: {
     ...location,
     address,
   },
-  imagePath, // ✅ ONLY store path
+  imagePath,
   createdBy: userId,
   status: "OPEN",
   priority,
   severityScore,
+
+  // 🧠 AI EXPLANATION (FOR ADMINS & JUDGES)
+  aiAnalysis: ai
+    ? {
+        model: "gpt-4o-mini",
+        isPublicGarbage: ai.isPublicGarbage,
+        confidence: ai.confidence,
+        severity: ai.severity,
+        reason: ai.reason,
+      }
+    : null,
+
   createdAt: admin.firestore.FieldValue.serverTimestamp(),
 });
 
@@ -607,4 +593,8 @@ app.get(
 /*************************************************
  * EXPORT EXPRESS APP
  *************************************************/
-exports.api = functions.https.onRequest(app);
+exports.api = functions.https.onRequest(
+  { secrets: [OPENAI_API_KEY] },
+  app
+);
+
